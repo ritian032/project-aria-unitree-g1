@@ -1,0 +1,13 @@
+按当前配置，仿真可以这样启动：
+终端 1：启动仿真
+conda activate unitree_sim_envexport PYTHONNOUSERSITE=1export CYCLONEDDS_HOME="$HOME/cyclonedds/install"export CMAKE_PREFIX_PATH="$HOME/cyclonedds/install:$CMAKE_PREFIX_PATH"cd ~/unitree_sim_isaaclabpython sim_main.py --device cpu --enable_cameras \  --task Isaac-Stack-RgyBlock-G129-Inspire-Joint \  --enable_inspire_dds \  --robot_type g129
+说明：
+--enable_inspire_dds：启用 Inspire 灵巧手 DDS，电脑摄像头版需要
+--task Isaac-Stack-RgyBlock-G129-Inspire-Joint：G129 + Inspire 手的任务
+若用其他任务，需保证带 --enable_inspire_dds 和 --robot_type g129
+等 Isaac Sim 窗口出现、G1 加载完成后再启动遥操作。
+终端 2：启动遥操作
+电脑摄像头：
+cd ~/unitree_sdk2_python/aria_g1_teleoppython webcam_teleop_g1.py
+Aria 眼镜：
+cd ~/unitree_sdk2_python/aria_g1_teleoppython aria_stereo_teleop_g1.py --sim
