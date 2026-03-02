@@ -1,13 +1,56 @@
 按当前配置，仿真可以这样启动：
+
 终端 1：启动仿真
-conda activate unitree_sim_envexport PYTHONNOUSERSITE=1export CYCLONEDDS_HOME="$HOME/cyclonedds/install"export CMAKE_PREFIX_PATH="$HOME/cyclonedds/install:$CMAKE_PREFIX_PATH"cd ~/unitree_sim_isaaclabpython sim_main.py --device cpu --enable_cameras \  --task Isaac-Stack-RgyBlock-G129-Inspire-Joint \  --enable_inspire_dds \  --robot_type g129
+
+conda activate unitree_sim_env
+export PYTHONNOUSERSITE=1
+export CYCLONEDDS_HOME="$HOME/cyclonedds/install"
+export CMAKE_PREFIX_PATH="$HOME/cyclonedds/install:$CMAKE_PREFIX_PATH"
+cd ~/unitree_sim_isaaclab
+
+# 方式 A：圆柱体（推荐，比方块更好抓）
+# 有 GPU 用 cuda，无 GPU 用 cpu
+python sim_main.py --device cuda --enable_cameras \
+  --task Isaac-PickPlace-Cylinder-G129-Inspire-Joint \
+  --enable_inspire_dds \
+  --robot_type g129
+
+# 方式 B：方块（红绿黄块堆叠）
+python sim_main.py --device cuda --enable_cameras \
+  --task Isaac-Stack-RgyBlock-G129-Inspire-Joint \
+  --enable_inspire_dds \
+  --robot_type g129
+
 说明：
---enable_inspire_dds：启用 Inspire 灵巧手 DDS，电脑摄像头版需要
---task Isaac-Stack-RgyBlock-G129-Inspire-Joint：G129 + Inspire 手的任务
-若用其他任务，需保证带 --enable_inspire_dds 和 --robot_type g129
+- 圆柱体任务抓取成功率更高（可捏合侧面）
+- 方块需要更精确对齐，较难抓
+- 有 GPU 用 --device cuda，无 GPU 用 --device cpu
+- 需带 --enable_inspire_dds 和 --robot_type g129
+
 等 Isaac Sim 窗口出现、G1 加载完成后再启动遥操作。
+
 终端 2：启动遥操作
+
 电脑摄像头：
-cd ~/unitree_sdk2_python/aria_g1_teleoppython webcam_teleop_g1.py
+cd ~/unitree_sdk2_python/aria_g1_teleop
+python webcam_teleop_g1.py
+
 Aria 眼镜：
-cd ~/unitree_sdk2_python/aria_g1_teleoppython aria_stereo_teleop_g1.py --sim
+cd ~/unitree_sdk2_python/aria_g1_teleop
+python aria_stereo_teleop_g1.py --sim
+
+
+
+Webcam 流程:
+  webcam_teleop_g1.py
+    ├── g1_arm_ik_standalone.py
+    ├── cv2.VideoCapture(0)           ← 电脑摄像头
+    ├── mediapipe.Hands
+    └── (webcam 自带 _send_inspire_open_ratios，未用 inspire_hand_utils)
+
+Aria 流程:
+  aria_stereo_teleop_g1.py
+    ├── aria_stereo_source.py         ← Aria 视频流
+    ├── stereo_teleop_arm.py          ← 双目手部跟踪
+    ├── g1_arm_ik_standalone.py
+    └── inspire_hand_utils.py

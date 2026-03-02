@@ -2,11 +2,12 @@
 """
 aria_stereo_teleop_g1.py
 
-Aria 眼镜双目遥操作 G1 双臂：
+Aria 眼镜双目遥操作 G1 双臂 + Inspire 双手：
 1. 双目立体显示 (左眼+右眼拼接)
 2. 双臂独立控制 (自动区分左右手)
 3. 相对位移控制 (按 'r' 键锁定零点)
 4. G1_29_ArmIK 精确 IK + 手离开保持、MediaPipe 置信度过滤
+5. Inspire 双手掌（捏合程度控制开合，左右手分别控制）
 """
 
 import argparse
@@ -17,8 +18,9 @@ import cv2
 import numpy as np
 import aria.sdk as aria
 
-# Unitree SDK（G1_29_ArmController 自管 DDS）
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+# Unitree SDK（G1_29_ArmController、Inspire DDS）
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_
 
 # 双臂 IK 使用本地封装
 _aria_g1_dir = os.path.dirname(os.path.abspath(__file__))
@@ -35,11 +37,21 @@ from teleop.robot_control.robot_arm import G1_29_ArmController
 # Custom Modules
 from stereo_teleop_arm import HandTracker, StereoHandTracker
 from aria_stereo_source import AriaStereoImageSource
+from inspire_hand_utils import (
+    calc_open_ratio_from_landmarks,
+    calc_finger_opens_from_landmarks,
+    send_inspire_open_ratios,
+)
 
 # ================== 核心配置 ==================
 SCALE_FACTOR = 1.5
 MAX_RELATIVE_DIST = 0.5
 MIN_HAND_CONFIDENCE = 0.5
+# Inspire 捏合映射（与 webcam 一致）
+PINCH_MIN = 0.12
+PINCH_MAX = 0.65
+INSPIRE_KP = 2.0
+INSPIRE_KD = 0.10
 
 # 坐标变换: Aria (Z前, X右, Y下) -> Robot (X前, Y左, Z上)
 ROTATION_MATRIX = np.array([
@@ -68,8 +80,8 @@ def main() -> None:
     parser.add_argument("--sim", action="store_true", help="仿真模式（Isaac Sim），DDS channel 1")
     args = parser.parse_args()
 
-    # ========= 1. 初始化 DDS 与 G1 手臂 =========
-    print("[1/3] 初始化 DDS 与 G1 手臂 IK...")
+    # ========= 1. 初始化 DDS、G1 手臂、Inspire 手掌 =========
+    print("[1/3] 初始化 DDS、G1 手臂 IK、Inspire 手掌...")
     if args.sim:
         ChannelFactoryInitialize(1)
     else:
@@ -77,6 +89,8 @@ def main() -> None:
 
     arm_ik = get_g1_arm_ik()
     arm_ctrl = G1_29_ArmController(motion_mode=False, simulation_mode=args.sim)
+    inspire_publisher = ChannelPublisher("rt/inspire/cmd", MotorCmds_)
+    inspire_publisher.Init()
 
     running_flag = [True]
 
@@ -107,12 +121,17 @@ def main() -> None:
     ref_hand_R = None
     last_left_target = None
     last_right_target = None
+    last_open_l = None
+    last_open_r = None
+    last_fingers_l = None
+    last_fingers_r = None
 
     print("\n" + "=" * 60)
-    print("🚀 系统就绪！操作指南：")
+    print("🚀 系统就绪！G1 双臂 + Inspire 双手：")
     print("  r: 激活/重置参考姿态")
     print("  h: 双臂回到 home 位姿")
     print("  q: 退出")
+    print("  （捏合拇指食指控制 Inspire 手开合）")
     print("=" * 60 + "\n")
 
     try:
@@ -122,20 +141,29 @@ def main() -> None:
                 time.sleep(0.005)
                 continue
 
-            hands_data, l_vis, r_vis = stereo_tracker.track_hands_3d_from_frames(left_frame, right_frame)
+            hands_data, hands_landmarks, l_vis, r_vis = stereo_tracker.track_hands_3d_from_frames(left_frame, right_frame)
 
             curr_hand_L = None
             curr_hand_R = None
+            landmarks_L = None
+            landmarks_R = None
             if hands_data and len(hands_data) > 0:
-                sorted_hands = sorted(hands_data, key=lambda p: p[0])
-                if len(sorted_hands) == 1:
-                    if sorted_hands[0][0] < 0:
-                        curr_hand_L = np.array(sorted_hands[0])
+                # 按 x 排序，保持 hands_data 与 hands_landmarks 一一对应
+                pairs = list(zip(hands_data, hands_landmarks if hands_landmarks else [[]] * len(hands_data)))
+                pairs = sorted(pairs, key=lambda p: p[0][0])
+                if len(pairs) == 1:
+                    hd, lm = pairs[0]
+                    if hd[0] < 0:
+                        curr_hand_L = np.array(hd)
+                        landmarks_L = lm if len(lm) >= 21 else None
                     else:
-                        curr_hand_R = np.array(sorted_hands[0])
-                elif len(sorted_hands) >= 2:
-                    curr_hand_L = np.array(sorted_hands[0])
-                    curr_hand_R = np.array(sorted_hands[1])
+                        curr_hand_R = np.array(hd)
+                        landmarks_R = lm if len(lm) >= 21 else None
+                elif len(pairs) >= 2:
+                    curr_hand_L = np.array(pairs[0][0])
+                    curr_hand_R = np.array(pairs[1][0])
+                    landmarks_L = pairs[0][1] if len(pairs[0][1]) >= 21 else None
+                    landmarks_R = pairs[1][1] if len(pairs[1][1]) >= 21 else None
 
             # --- 键盘交互 ---
             key = cv2.waitKey(1) & 0xFF
@@ -196,14 +224,39 @@ def main() -> None:
                 except Exception as e:
                     print(f"[IK] 求解错误: {e}")
 
+                # Inspire 双手掌：捏合→开合，手离开时保持上一帧
+                if landmarks_L is not None:
+                    last_open_l = calc_open_ratio_from_landmarks(
+                        np.array(landmarks_L), PINCH_MIN, PINCH_MAX
+                    )
+                    last_fingers_l = calc_finger_opens_from_landmarks(np.array(landmarks_L))
+                if landmarks_R is not None:
+                    last_open_r = calc_open_ratio_from_landmarks(
+                        np.array(landmarks_R), PINCH_MIN, PINCH_MAX
+                    )
+                    last_fingers_r = calc_finger_opens_from_landmarks(np.array(landmarks_R))
+                send_inspire_open_ratios(
+                    inspire_publisher,
+                    open_right=last_open_r,
+                    open_left=last_open_l,
+                    fingers_right=last_fingers_r,
+                    fingers_left=last_fingers_l,
+                    inspire_kp=INSPIRE_KP,
+                    inspire_kd=INSPIRE_KD,
+                )
+
             # --- 双目可视化 ---
             if l_vis is not None and r_vis is not None:
                 color = (0, 255, 0) if teleop_active else (0, 0, 255)
                 text = "ACTIVE" if teleop_active else "STANDBY (Press 'r')"
                 cv2.putText(l_vis, f"L-Cam: {text}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                if last_open_l is not None:
+                    cv2.putText(l_vis, f"Inspire L: {last_open_l:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(r_vis, "R-Cam", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                if last_open_r is not None:
+                    cv2.putText(r_vis, f"Inspire R: {last_open_r:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 combined_img = np.hstack((l_vis, r_vis))
-                cv2.imshow("Aria Stereo Teleop (Left / Right)", combined_img)
+                cv2.imshow("Aria Stereo Teleop (G1 arms + Inspire hands)", combined_img)
 
     finally:
         running_flag[0] = False

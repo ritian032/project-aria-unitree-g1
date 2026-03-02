@@ -123,8 +123,13 @@ class StereoCamera:
 class HandTracker:
     """手部跟踪器（使用 MediaPipe 或 OpenCV）"""
     
-    def __init__(self):
-        """初始化手部跟踪器"""
+    def __init__(self, min_hand_confidence: float = 0.5):
+        """初始化手部跟踪器
+
+        Args:
+            min_hand_confidence: MediaPipe 置信度阈值，低于此值的手部检测将被过滤
+        """
+        self.min_hand_confidence = min_hand_confidence
         # 优先尝试使用 MediaPipe，不同版本的 API 稍有差异，这里做兼容处理
         try:
             import mediapipe as mp
@@ -166,9 +171,10 @@ class HandTracker:
         """使用 MediaPipe 检测手部
         
         Returns:
-            list: 每个元素是 (landmarks, handedness) 的元组
+            list: 每个元素是 (landmarks, handedness, score) 的元组，仅包含置信度 >= min_hand_confidence 的检测
             - landmarks: 21个关键点的列表 [[x, y, z], ...]
             - handedness: 'Left' 或 'Right'（用户的左手或右手）
+            - score: MediaPipe 置信度 [0..1]
         """
         # MediaPipe Hands expects RGB 3-channel input
         if image is None:
@@ -179,27 +185,14 @@ class HandTracker:
         results = self.hands.process(rgb_image)
         
         hands_data = []
-        if results.multi_hand_landmarks:
-            # 获取 handedness（左右手分类）
-            handedness_list = []
-            if results.multi_handedness:
-                for handedness in results.multi_handedness:
-                    # handedness.classification[0].label 是 'Left' 或 'Right'
-                    label = handedness.classification[0].label
-                    handedness_list.append(label)
-            
-            for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                # 提取关键点（21个点）
-                landmarks = []
-                for landmark in hand_landmarks.landmark:
-                    landmarks.append([landmark.x, landmark.y, landmark.z])
-                
-                # 获取对应的 handedness（如果可用）
-                handedness = handedness_list[idx] if idx < len(handedness_list) else None
-                
-                # 返回 (landmarks, handedness) 元组
-                hands_data.append((landmarks, handedness))
-        
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                label = handedness.classification[0].label
+                score = float(handedness.classification[0].score)
+                if score < self.min_hand_confidence:
+                    continue
+                landmarks = [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark]
+                hands_data.append((landmarks, label, score))
         return hands_data
     
     def _detect_opencv(self, image: np.ndarray) -> list:
@@ -264,10 +257,10 @@ class StereoHandTracker:
         # 调试：显示检测到的数量（用于终端和图像窗口）
         debug_info = f"左图: {len(left_hands_raw)} 只手, 右图: {len(right_hands_raw)} 只手"
         
-        # 解析检测结果：可能是旧格式（只有landmarks）或新格式（(landmarks, handedness)元组）
+        # 解析检测结果：新格式 (landmarks, handedness, score) 或 (landmarks, handedness)
         def parse_hand_data(hand_data):
             """解析手部数据，兼容新旧格式"""
-            if isinstance(hand_data, tuple) and len(hand_data) == 2:
+            if isinstance(hand_data, tuple) and len(hand_data) >= 2:
                 return hand_data[0], hand_data[1]  # (landmarks, handedness)
             else:
                 return hand_data, None  # 旧格式，只有landmarks
@@ -279,6 +272,7 @@ class StereoHandTracker:
         # 目标：用户的左手 → hands_3d[0]，用户的右手 → hands_3d[1]
         hands_3d: list[list[float]] = []
         hands_handedness: list[str] = []  # 记录每只手的 handedness
+        hands_landmarks: list[list] = []  # 每只手对应的 MediaPipe landmarks，用于 Inspire 捏合
 
         if len(left_hands) > 0 and len(right_hands) > 0:
             h, w = left_frame.shape[:2]
@@ -353,12 +347,15 @@ class StereoHandTracker:
                     hands_3d.append([float(x), float(y), float(z)])
                     # 使用左图的 handedness（更可靠）
                     hands_handedness.append(left_hand or 'Unknown')
+                    # 保存左图 landmarks 供 Inspire 捏合计算
+                    hands_landmarks.append(left_landmarks)
             
             # 确保顺序：用户的左手 hands_3d[0]，用户的右手 hands_3d[1]
             if len(hands_3d) == 2 and len(hands_handedness) == 2:
                 if hands_handedness[0] == 'Right' and hands_handedness[1] == 'Left':
                     hands_3d[0], hands_3d[1] = hands_3d[1], hands_3d[0]
                     hands_handedness[0], hands_handedness[1] = hands_handedness[1], hands_handedness[0]
+                    hands_landmarks[0], hands_landmarks[1] = hands_landmarks[1], hands_landmarks[0]
         
         # 在图像上绘制手部关键点（使用之前检测的结果）
         if self.hand_tracker.use_mediapipe:
@@ -392,30 +389,31 @@ class StereoHandTracker:
         if len(left_hands_raw) != len(right_hands_raw) or len(left_hands_raw) >= 2:
             print(f"[调试] {debug_info} -> 匹配到 {len(hands_3d)} 只手的3D位置")
         
-        # 返回 hands_3d 和 handedness 信息（用于调试）
+        # 返回 hands_3d、hands_landmarks（与 hands_3d 一一对应，用于 Inspire 捏合）、可视化帧
         # 注意：hands_3d[0] 应该是用户的左手，hands_3d[1] 应该是用户的右手
         
-        return hands_3d, left_frame, right_frame
+        return hands_3d, hands_landmarks, left_frame, right_frame
 
-    def track_hands_3d(self) -> Tuple[Optional[list], Optional[np.ndarray], Optional[np.ndarray]]:
+    def track_hands_3d(self) -> Tuple[Optional[list], list, Optional[np.ndarray], Optional[np.ndarray]]:
         """
         使用内部 StereoCamera 采集图像并跟踪手部3D位置。
-        原有接口保持不变，供 USB 双目摄像头使用。
+        返回 (hands_3d, hands_landmarks, left_frame, right_frame)。
         """
         left_frame, right_frame = self.stereo_camera.read_frames()
         if left_frame is None or right_frame is None:
-            return None, None, None
+            return None, [], None, None
         return self._track_hands_3d_from_frames(left_frame, right_frame)
 
     def track_hands_3d_from_frames(
         self, left_frame: np.ndarray, right_frame: np.ndarray
-    ) -> Tuple[Optional[list], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[list], list, Optional[np.ndarray], Optional[np.ndarray]]:
         """
         从外部传入的左右图像跟踪手部3D位置。
         供 Aria SLAM 图像等外部双目源调用。
+        返回 (hands_3d, hands_landmarks, left_frame, right_frame)。
         """
         if left_frame is None or right_frame is None:
-            return None, None, None
+            return None, [], None, None
         return self._track_hands_3d_from_frames(left_frame, right_frame)
 
 
@@ -431,6 +429,29 @@ class ArmController:
         self.target_positions = [0.0] * 30
         self.kp = 60.0
         self.kd = 1.5
+        # 针对 G1 关节做一个大致的角度范围限制（弧度），防止动作过大/反关节
+        # 数值是经验值，主要目的是约束而不是精确复现官方极限
+        self.joint_limits = {
+            # 左臂
+            G1JointIndex.LeftShoulderPitch: (-1.6, 1.6),
+            G1JointIndex.LeftShoulderRoll: (-1.2, 1.2),
+            G1JointIndex.LeftShoulderYaw: (-1.8, 1.8),
+            G1JointIndex.LeftElbow: (0.0, 2.6),
+            G1JointIndex.LeftWristRoll: (-1.8, 1.8),
+            G1JointIndex.LeftWristPitch: (-1.5, 1.5),
+            G1JointIndex.LeftWristYaw: (-1.8, 1.8),
+            # 右臂
+            G1JointIndex.RightShoulderPitch: (-1.6, 1.6),
+            G1JointIndex.RightShoulderRoll: (-1.2, 1.2),
+            G1JointIndex.RightShoulderYaw: (-1.8, 1.8),
+            G1JointIndex.RightElbow: (0.0, 2.6),
+            G1JointIndex.RightWristRoll: (-1.8, 1.8),
+            G1JointIndex.RightWristPitch: (-1.5, 1.5),
+            G1JointIndex.RightWristYaw: (-1.8, 1.8),
+        }
+        # 关节变化的最大步长（rad/控制周期），用于简单限速；过大易抖，过小机械臂响应慢
+        # 为了让手臂更容易跟上目标，这里适当加大
+        self.max_joint_step = 0.25
         self.mirror_mode = mirror_mode  # 镜像模式：一只手控制两只臂
         
         # 手臂关节索引
@@ -460,6 +481,8 @@ class ArmController:
         
         self.low_state = None
         self.first_update = False
+        # 记录仿真启动时的初始关节姿态，用于一键回到“初始站姿”
+        self.initial_positions = None
 
     def update_targets_absolute(self, targets_list):
         """
@@ -492,60 +515,70 @@ class ArmController:
         """更新机器人状态"""
         if not self.first_update:
             self.low_state = low_state
+            self.initial_positions = []
             for i in range(30):
                 if i < len(low_state.motor_state):
-                    self.target_positions[i] = low_state.motor_state[i].q
+                    q_i = low_state.motor_state[i].q
+                    self.target_positions[i] = q_i
+                    self.initial_positions.append(q_i)
+                else:
+                    self.target_positions[i] = 0.0
+                    self.initial_positions.append(0.0)
             self.first_update = True
             print("已读取机器人当前状态")
         else:
             self.low_state = low_state
     
+    def reset_to_initial(self):
+        """将目标关节位置重置为仿真启动时的初始姿态"""
+        if self.initial_positions is None:
+            print("尚未读取到初始姿态，无法重置")
+            return
+        for i in range(min(len(self.target_positions), len(self.initial_positions))):
+            self.target_positions[i] = float(self.initial_positions[i])
+        print("已将机器人目标关节重置为初始姿态")
+    
     def compute_ik_from_hand_position(self, hand_3d_pos: list, is_left_arm: bool = True) -> list:
         """
-        根据手部3D位置计算逆运动学（简化版）
+        根据“手的相对位移”直接映射到关节角（线性近似 IK）
         
-        Args:
-            hand_3d_pos: 手部3D位置 [x, y, z]（米）
-            is_left_arm: 是否为左臂
-        
-        Returns:
-            list: 7个关节的目标角度（弧度）
+        说明：
+            - hand_3d_pos 被视为相对位移 [dx, dy, dz]，数值越大关节转动越多
+            - 为避免缩放过大失控，先将 dx, dy, dz 归一化到 [-1, 1] 再映射到关节角
         """
-        x, y, z = hand_3d_pos
-        
-        # 简化版IK（仅用于演示，实际需要完整的IK求解器）
-        # 这里使用简单的几何关系
-        
-        # 相对于手臂基座的坐标
-        # 水平方向取反：让画面中的左右与机器人坐标系左右对齐
-        # ========== AR 眼镜遥操效果：手向右移动 → 机器人手臂向右移动 ==========
-        # X 方向（左右）：改为不取反，实现直观的左右跟随
-        rel_x = -x   # 左右：手向右→臂向右（若反则改为 x）
-        # 上下方向符号翻转：让“手在图像里往上移动”对应肩正向滚
-        # Y 方向（上下）：统一处理左右臂，实现直观的上下跟随
-        rel_y = y    # 上下：手向上→臂向上（若反则改为 -y）
-        # 注意：我们希望“手越靠近相机（z 越小），肩越向前抬”
-        # 之前用 z - arm_base_height，近处会得到负值，导致肩向后甩
-        # 这里改成 arm_base_height - z，让 z 变小 → rel_z 变大 → 肩向前抬
-        rel_z = self.arm_base_height - z
-        
-        # 计算到目标的距离
-        distance = np.sqrt(rel_x**2 + rel_y**2 + rel_z**2)
-        distance = np.clip(distance, 0.1, self.arm_reach)
-        
-        # 简化的关节角度计算
-        shoulder_pitch = np.arctan2(rel_z, np.sqrt(rel_x**2 + rel_y**2))
-        shoulder_roll = np.arctan2(rel_y, rel_x)
-        shoulder_yaw = 0.0  # 简化
-        
-        # 肘部角度（基于距离）
-        elbow = np.pi - 2 * np.arcsin(distance / (2 * 0.3))  # 假设上臂和下臂各0.3米
-        
-        # 手腕角度（简化）
+        if hand_3d_pos is None or len(hand_3d_pos) < 3:
+            return [0.0] * 7
+
+        dx_raw, dy_raw, dz_raw = hand_3d_pos
+
+        # 使用双曲正切把输入压缩到 [-1, 1]，避免缩放系数过大导致数值爆炸，
+        # 同时保证小位移时仍然近似线性
+        dx = float(np.tanh(dx_raw))
+        dy = float(np.tanh(dy_raw))
+        dz = float(np.tanh(dz_raw))
+
+        # 关节角线性映射系数（rad/单位归一化位移），尽量接近关节可用范围
+        k_yaw = 1.8    # 左右转肩
+        k_roll = 1.6   # 侧倾肩
+        k_pitch = 2.0  # 前后抬肩
+        k_elbow = 1.5  # 弯肘变化
+
+        # 直观映射：
+        # dx：水平左右 → 肩 yaw
+        shoulder_yaw = dx * k_yaw
+        # dy：图像中向上/向下 → 肩 roll/pitch（这里简单用 pitch 控制抬起/放下）
+        shoulder_roll = dy * k_roll
+        shoulder_pitch = dz * k_pitch
+
+        # 肘关节：以一个基础弯曲角为中心，前后位移决定弯曲/伸直
+        base_elbow = 1.5  # 中等弯曲
+        elbow = base_elbow - dz * k_elbow
+
+        # 手腕角度由上层（比如翻转手腕逻辑）单独控制，这里保持 0
         wrist_roll = 0.0
         wrist_pitch = 0.0
         wrist_yaw = 0.0
-        
+
         return [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw]
     
     def update_targets_from_hands(self, hands_3d: list):
@@ -623,7 +656,23 @@ def LowCmdWrite(controller: ArmController, publisher, crc, running_flag):
                     low_cmd.motor_cmd[i].kp = controller.kp * 2.0
                     low_cmd.motor_cmd[i].kd = controller.kd * 2.0
                 elif i in all_arm_joints:
-                    low_cmd.motor_cmd[i].q = float(target_positions[i])
+                    # 关节角目标（期望值）
+                    target_q = float(target_positions[i])
+                    # 当前实际关节角
+                    current_q = controller.low_state.motor_state[i].q
+                    # 简单限速：每个控制周期最大角度变化 self.max_joint_step
+                    max_step = getattr(controller, "max_joint_step", None)
+                    if max_step is not None:
+                        delta = np.clip(target_q - current_q, -max_step, max_step)
+                        cmd_q = current_q + float(delta)
+                    else:
+                        cmd_q = target_q
+                    # 关节角度裁剪到安全范围内（如果配置了的话）
+                    limits = getattr(controller, "joint_limits", {}).get(i)
+                    if limits is not None:
+                        q_min, q_max = limits
+                        cmd_q = float(np.clip(cmd_q, q_min, q_max))
+                    low_cmd.motor_cmd[i].q = cmd_q
                     low_cmd.motor_cmd[i].kp = controller.kp
                     low_cmd.motor_cmd[i].kd = controller.kd
                 elif i == G1JointIndex.kNotUsedJoint:
@@ -723,6 +772,8 @@ if __name__ == "__main__":
             # 跟踪手部
             hands_3d, left_frame, right_frame = stereo_hand_tracker.track_hands_3d()
             
+            hands_3d, hands_landmarks, left_frame, right_frame = stereo_hand_tracker.track_hands_3d()
+
             if hands_3d is not None and left_frame is not None and right_frame is not None:
                 # 更新控制器目标
                 controller.update_targets_from_hands(hands_3d)
